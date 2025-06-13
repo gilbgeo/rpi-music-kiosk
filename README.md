@@ -46,9 +46,6 @@ Spotifyd (client Spotify en ligne de commande)
 
 l'environnement graphique
 
-Capture d'écran (optionnel)
-
-(Ajouter ici une capture d'écran du Kiosk en fonctionnement)
 ## Capture d'écran
 
 ![Interface Kiosk](images/kiosk-interface.png)
