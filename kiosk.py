@@ -48,7 +48,8 @@ ALSA_DEVICE = config.get("AUDIO", "ALSA_DEVICE")
 ALBUM_ART_SIZE = (200, 200)
 PCM = config.get("AUDIO", "PCM")
 TMP = config.get("AUDIO", "TMP")
-DURATION = config.getint("AUDIO", "DURATION")
+CHECK_DURATION = config.getint("AUDIO", "CHECK_DURATION")
+MIN_SILENCE = config.getint("AUDIO", "MIN_SILENCE")
 DURATION_SHAZAM = config.getint("AUDIO", "DURATION_SHAZAM")
 SILENCE_THRESHOLD = config.getint("AUDIO", "SILENCE_THRESHOLD")
 
@@ -105,6 +106,10 @@ def get_spotifyd_mpris_name(bus):
     return None
 
 class BluetoothRecognizer:
+    WAIT_MUSIC   = 0
+    RECOGNIZE    = 1
+    WAIT_SILENCE = 2
+    
     def __init__(self, ui_callback):
         self.ui_callback = ui_callback
         self.shazam = Shazam()
@@ -131,53 +136,73 @@ class BluetoothRecognizer:
         if self.loop_running:
             return
         self.loop_running = True
+        self.state = self.WAIT_MUSIC
         threading.Thread(target=self.loop, daemon=True).start()
 
     def stop(self):
         self.loop_running = False
 
     def loop(self):
-        silence_detected = False
+        silence_started_at = None
 
         while self.loop_running:
-            self.record_audio(TMP, DURATION)
-            is_silent = self.check_silence(TMP)
+            # --- SONDE COURTE ---
+            self.record_audio(TMP, CHECK_DURATION)
+            silent = self.check_silence(TMP)
 
-            if is_silent:
-                print("Silence détecté.")
-                time.sleep(5)
-                silence_detected = True
+            if self.state == self.WAIT_MUSIC:
+                # ↳ on attend simplement du son
+                if not silent:
+                    self.state = self.RECOGNIZE          # son détecté
+                    continue
+
+            elif self.state == self.RECOGNIZE:
+                # ↳ on va interroger Shazam (une seule fois)
+                self._run_shazam()
+                # si Shazam a trouvé quelque chose,
+                # _run_shazam met self.state = WAIT_SILENCE
+                # sinon on reste en WAIT_MUSIC
+                continue
+
+            elif self.state == self.WAIT_SILENCE:
+                if silent:
+                    if silence_started_at is None:
+                        silence_started_at = time.time()
+                    elif time.time() - silence_started_at >= MIN_SILENCE:
+                        # blanc assez long ⇒ on repart de zéro
+                        self.state = self.WAIT_MUSIC
+                        silence_started_at = None
+                        # on ne remet PAS last_track_id à None pour éviter
+                        # les doublons si la même chanson reprend
+                else:
+                    silence_started_at = None  # reset si bruit
+
+            time.sleep(0.3)   # cadence de sondage très réactive
+
+    # ---------------- helper Shazam ------------------
+    def _run_shazam(self):
+        print("🎧 Musique détectée, interrogation Shazam…")
+        self.record_audio(TMP, DURATION_SHAZAM)
+        track = asyncio.run(self.recognize_song(TMP))
+
+        if track:
+            if track['id'] != self.last_track_id:
+                self.last_track_id = track['id']
+                self.ui_callback(track)
+                print(f"🎶 {track['artist']} – {track['title']}")
             else:
-                if self.last_track_id is None:
-                    self.record_audio(TMP, DURATION_SHAZAM)
-                    print("Son détecté (phase initiale), interrogation Shazam...")
-                    track = asyncio.run(self.recognize_song(TMP))
-                    if track and track['id'] != self.last_track_id:
-                        self.last_track_id = track['id']
-                        self.ui_callback(track)
-                        print(f"🎶 Chanson trouvée : {track['artist']} - {track['title']}")
-                elif silence_detected:
-                    print("🎵 Fin de silence → son détecté → possible nouveau morceau")
-                    self.record_audio(TMP, DURATION_SHAZAM)
-                    track = asyncio.run(self.recognize_song(TMP))
-                    if track:
-                        if track['id'] != self.last_track_id:
-                            self.last_track_id = track['id']
-                            self.ui_callback(track)
-                            print(f"🎶 Nouveau morceau détecté : {track['artist']} - {track['title']}")
-                        else:
-                            print("Aucune nouvelle chanson détectée.")
-                    else:
-                        print("Aucun titre trouvé. Réinitialisation de l’affichage.")
-                        self.ui_callback({
-                            'title': "Mode enceinte Bluetooth !",
-                            'artist': "",
-                            'album': "",
-                            'cover': None
-                        })
-                    silence_detected = False
-
-            time.sleep(1)
+                print("Même piste qu’avant ; on ignore.")
+            self.state = self.WAIT_SILENCE             # on attend le prochain blanc
+        else:
+            print("Aucun titre trouvé. Réinitialisation de l’affichage.")
+            self.last_track_id = None
+            self.ui_callback({
+                'title': "Mode enceinte Bluetooth !",
+                'artist': "",
+                'album': "",
+                'cover': None
+            })
+            self.state = self.WAIT_SILENCE              # on ré-écoute le son
 
     def record_audio(self, filepath, duration):
         subprocess.run([
